@@ -2032,7 +2032,8 @@ Use `eglot-managed-p' to determine if current buffer is managed.")
     (unless (eglot--stay-out-of-p 'imenu)
       (add-function :before-until (local 'imenu-create-index-function)
                     #'eglot-imenu))
-    (unless (eglot--stay-out-of-p 'flymake) (flymake-mode 1))
+    (unless (eglot--stay-out-of-p 'flymake)
+      (let ((eglot--flymake-start t)) (flymake-mode 1)))
     (unless (eglot--stay-out-of-p 'eldoc)
       (add-hook 'eldoc-documentation-functions #'eglot-hover-eldoc-function
                 nil t)
@@ -2459,14 +2460,14 @@ expensive cached value of `file-truename'.")
                                              collect it)))
                           `((face . ,faces))))))
            into diags
-           finally (cond ((and
-                           ;; only add to current report if Flymake
-                           ;; starts on idle-timer (github#958)
-                           (not (null flymake-no-changes-timeout))
-                           eglot--current-flymake-report-fn)
-                          (eglot--report-to-flymake diags))
-                         (t
-                          (setq eglot--diagnostics diags)))))
+           finally
+           (setq eglot--diagnostics diags)
+           (when (and
+                  ;; only add to current report if Flymake
+                  ;; starts on idle-timer (github#958)
+                  (not (null flymake-no-changes-timeout))
+                  eglot--current-flymake-report-fn)
+             (let ((eglot--flymake-start t)) (flymake-start)))))
       (cl-loop
        for diag-spec across diagnostics
        collect (eglot--dbind ((Diagnostic) code range message severity source) diag-spec
@@ -2852,15 +2853,20 @@ When called interactively, use the currently active server"
       :text (buffer-substring-no-properties (point-min) (point-max))
       :textDocument (eglot--TextDocumentIdentifier)))))
 
+(defvar-local eglot--flymake-start nil
+  "`eglot--flymake-start' is set when eglot is publishing new diagnostics.
+Because diagnostics are published asynchronously by the server, this prevents
+sending out-of-date diagnostics to flymake, which would interfere with its
+change detection.")
+
 (defun eglot-flymake-backend (report-fn &rest _more)
   "A Flymake backend for Eglot.
-Calls REPORT-FN (or arranges for it to be called) when the server
-publishes diagnostics.  Between calls to this function, REPORT-FN
-may be called multiple times (respecting the protocol of
-`flymake-diagnostic-functions')."
+Arranges for REPORT-FN to be called when the server publishes diagnostics."
   (cond (eglot--managed-mode
+         (message "[ttuegel]: eglot--flymake-start: %s" eglot--flymake-start)
          (setq eglot--current-flymake-report-fn report-fn)
-         (eglot--report-to-flymake eglot--diagnostics))
+         (when eglot--flymake-start
+           (eglot--report-to-flymake eglot--diagnostics)))
         (t
          (funcall report-fn nil))))
 
@@ -2868,13 +2874,7 @@ may be called multiple times (respecting the protocol of
   "Internal helper for `eglot-flymake-backend'."
   (save-restriction
     (widen)
-    (funcall eglot--current-flymake-report-fn diags
-             ;; If the buffer hasn't changed since last
-             ;; call to the report function, flymake won't
-             ;; delete old diagnostics.  Using :region
-             ;; keyword forces flymake to delete
-             ;; them (github#159).
-             :region (cons (point-min) (point-max))))
+    (funcall eglot--current-flymake-report-fn diags))
   (setq eglot--diagnostics diags))
 
 (defun eglot-xref-backend () "Eglot xref backend." 'eglot)
