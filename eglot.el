@@ -110,6 +110,7 @@
 (require 'diff)
 (require 'track-changes)
 (require 'compat)
+(require 'dash)
 
 ;; These dependencies are also GNU ELPA core packages.  Because of
 ;; bug#62576, since there is a risk that M-x package-install, despite
@@ -2106,6 +2107,40 @@ Use `eglot-managed-p' to determine if current buffer is managed.")
 (defvar-local eglot--diagnostics nil
   "Flymake diagnostics for this buffer.")
 
+(defun eglot--from-lsp-diagnostic (diagnostic)
+  "Convert LSP diagnostic DIAGNOSTIC to our internal representation."
+  (eglot--dbind ((Diagnostic) code range message severity source tags) diagnostic
+    (-let* (((&plist :start range-start :end range-end) range)
+            (level (cond ((null severity) 'eglot-error)
+                         ((<= severity 1) 'eglot-error)
+                         ((= severity 2)  'eglot-warning)
+                         (t               'eglot-note)))
+            (full-message (concat source (and code (format " [%s]" code)) ": " message))
+            (faces (cl-loop for tag across tags
+                            when (alist-get tag eglot--tag-faces)
+                            collect it)))
+      (list :buffer (current-buffer)
+            :range (cons (eglot--lsp-position-to-point range-start 'markers)
+                         (eglot--lsp-position-to-point range-end 'markers))
+            :level level
+            :message full-message
+            :faces faces))))
+
+(defun eglot--into-flymake-diagnostic (diagnostic)
+  "Convert our DIAGNOSTIC into a diagnostic for Flymake."
+  (-let* (((range-start-marker . range-end-marker) (plist-get diagnostic :range))
+          (level (plist-get diagnostic :level))
+          (message (plist-get diagnostic :message))
+          (buffer (plist-get diagnostic :buffer))
+          (faces (plist-get diagnostic :faces)))
+    (eglot--make-diag buffer
+                      (marker-position range-start-marker)
+                      (marker-position range-end-marker)
+                      level
+                      message
+                      nil
+                      (when faces `((face . ,faces))))))
+
 (defvar revert-buffer-preserve-modes)
 (defun eglot--after-revert-hook ()
   "Eglot's `after-revert-hook'."
@@ -2408,83 +2443,12 @@ expensive cached value of `file-truename'.")
   (server (_method (eql textDocument/publishDiagnostics)) &key uri diagnostics
            &allow-other-keys) ; FIXME: doesn't respect `eglot-strict-mode'
   "Handle notification publishDiagnostics."
-  (cl-flet ((eglot--diag-type (sev)
-              (cond ((null sev) 'eglot-error)
-                    ((<= sev 1) 'eglot-error)
-                    ((= sev 2)  'eglot-warning)
-                    (t          'eglot-note)))
-            (mess (source code message)
-              (concat source (and code (format " [%s]" code)) ": " message))
-            (find-it (abspath)
-              ;; `find-buffer-visiting' would be natural, but calls the
-              ;; potentially slow `file-truename' (bug#70036).
-              (cl-loop for b in (eglot--managed-buffers server)
-                       when (with-current-buffer b
-                              (equal (car eglot--TextDocumentIdentifier-cache)
-                                     abspath))
-                       return b)))
-    (if-let* ((path (expand-file-name (eglot-uri-to-path uri)))
-              (buffer (find-it path)))
-        (with-current-buffer buffer
-          (cl-loop
-           initially
-           (setq flymake-list-only-diagnostics
-                 (assoc-delete-all path flymake-list-only-diagnostics))
-           for diag-spec across diagnostics
-           collect (eglot--dbind ((Diagnostic) range code message severity source tags)
-                       diag-spec
-                     (setq message (mess source code message))
-                     (pcase-let
-                         ((`(,beg . ,end) (eglot-range-region range)))
-                       ;; Fallback to `flymake-diag-region' if server
-                       ;; botched the range
-                       (when (= beg end)
-                         (if-let* ((st (plist-get range :start))
-                                   (diag-region
-                                    (flymake-diag-region
-                                     (current-buffer) (1+ (plist-get st :line))
-                                     (plist-get st :character))))
-                             (setq beg (car diag-region) end (cdr diag-region))
-                           (eglot--widening
-                            (goto-char (point-min))
-                            (setq beg
-                                  (eglot--bol
-                                   (1+ (plist-get (plist-get range :start) :line))))
-                            (setq end
-                                  (line-end-position
-                                   (1+ (plist-get (plist-get range :end) :line)))))))
-                       (eglot--make-diag
-                        (current-buffer) beg end
-                        (eglot--diag-type severity)
-                        message `((eglot-lsp-diag . ,diag-spec))
-                        (when-let* ((faces
-                                     (cl-loop for tag across tags
-                                              when (alist-get tag eglot--tag-faces)
-                                              collect it)))
-                          `((face . ,faces))))))
-           into diags
-           finally (cond ((and
-                           ;; only add to current report if Flymake
-                           ;; starts on idle-timer (github#958)
-                           (not (null flymake-no-changes-timeout))
-                           eglot--current-flymake-report-fn)
-                          (eglot--report-to-flymake diags))
-                         (t
-                          (setq eglot--diagnostics diags)))))
-      (cl-loop
-       for diag-spec across diagnostics
-       collect (eglot--dbind ((Diagnostic) code range message severity source) diag-spec
-                 (setq message (mess source code message))
-                 (let* ((start (plist-get range :start))
-                        (line (1+ (plist-get start :line)))
-                        (char (1+ (plist-get start :character))))
-                   (eglot--make-diag
-                    path (cons line char) nil (eglot--diag-type severity) message)))
-       into diags
-       finally
-       (setq flymake-list-only-diagnostics
-             (assoc-delete-all path flymake-list-only-diagnostics))
-       (push (cons path diags) flymake-list-only-diagnostics)))))
+  (-when-let* ((filename (expand-file-name (eglot-uri-to-path uri)))
+               (buffer (find-file-noselect filename)))
+    (with-current-buffer buffer
+      (setq eglot--diagnostics
+            (--map (eglot--from-lsp-diagnostic it) (seq-into diagnostics 'list)))
+      (when flymake-mode (flymake-start)))))
 
 (cl-defun eglot--register-unregister (server things how)
   "Helper for `registerCapability'.
@@ -2865,8 +2829,7 @@ publishes diagnostics.  Between calls to this function, REPORT-FN
 may be called multiple times (respecting the protocol of
 `flymake-diagnostic-functions')."
   (cond (eglot--managed-mode
-         (setq eglot--current-flymake-report-fn report-fn)
-         (eglot--report-to-flymake eglot--diagnostics))
+         (funcall report-fn (--map (eglot--into-flymake-diagnostic it) eglot--diagnostics)))
         (t
          (funcall report-fn nil))))
 
