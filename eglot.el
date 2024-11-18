@@ -1947,9 +1947,6 @@ and just return it.  PROMPT shouldn't end with a question mark."
     (define-key map [remap display-local-help] #'eldoc-doc-buffer)
     map))
 
-(defvar-local eglot--current-flymake-report-fn nil
-  "Current flymake report function for this buffer.")
-
 (defvar-local eglot--saved-bindings nil
   "Bindings saved by `eglot--setq-saving'.")
 
@@ -2063,9 +2060,7 @@ Use `eglot-managed-p' to determine if current buffer is managed.")
     (cl-loop for (var . saved-binding) in eglot--saved-bindings
              do (set (make-local-variable var) saved-binding))
     (remove-function (local 'imenu-create-index-function) #'eglot-imenu)
-    (when eglot--current-flymake-report-fn
-      (eglot--report-to-flymake nil)
-      (setq eglot--current-flymake-report-fn nil))
+    (setq eglot--diagnostics nil)
     (run-hooks 'eglot-managed-mode-hook)
     (let ((server eglot--cached-server))
       (setq eglot--cached-server nil)
@@ -2832,19 +2827,6 @@ may be called multiple times (respecting the protocol of
          (funcall report-fn (--map (eglot--into-flymake-diagnostic it) eglot--diagnostics)))
         (t
          (funcall report-fn nil))))
-
-(defun eglot--report-to-flymake (diags)
-  "Internal helper for `eglot-flymake-backend'."
-  (save-restriction
-    (widen)
-    (funcall eglot--current-flymake-report-fn diags
-             ;; If the buffer hasn't changed since last
-             ;; call to the report function, flymake won't
-             ;; delete old diagnostics.  Using :region
-             ;; keyword forces flymake to delete
-             ;; them (github#159).
-             :region (cons (point-min) (point-max))))
-  (setq eglot--diagnostics diags))
 
 (defun eglot-xref-backend () "Eglot xref backend." 'eglot)
 
